@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 YT Transcriber - YouTube Transcript Fetcher
-A standalone web app to pull, view, copy, and download transcripts from YouTube videos.
+Standalone web app to pull, view, copy, and download transcripts.
+Uses cookies to bypass YouTube IP blocking on cloud servers.
 """
 
 import os
@@ -14,8 +15,24 @@ import urllib.error
 
 app = Flask(__name__)
 
-# Initialize the API (v1.x syntax)
-yt_api = YouTubeTranscriptApi()
+# ── Initialize API with cookies if available ──
+# Cookies fix the "YouTube is blocking requests from your IP" error
+# on cloud servers (Render, Railway, etc.)
+COOKIE_PATH = os.environ.get("COOKIE_PATH", "/etc/secrets/cookies.txt")
+
+if not os.path.exists(COOKIE_PATH):
+    # Try local cookies.txt in same directory
+    local_cookie = os.path.join(os.path.dirname(__file__), "cookies.txt")
+    if os.path.exists(local_cookie):
+        COOKIE_PATH = local_cookie
+
+if os.path.exists(COOKIE_PATH):
+    print(f"  Using cookies from: {COOKIE_PATH}")
+    yt_api = YouTubeTranscriptApi(cookie_path=COOKIE_PATH)
+else:
+    print("  No cookies found. YouTube may block cloud IPs.")
+    print("  To fix: add cookies.txt (see README)")
+    yt_api = YouTubeTranscriptApi()
 
 
 def extract_video_id(url: str) -> str:
@@ -32,7 +49,7 @@ def extract_video_id(url: str) -> str:
 
 
 def get_video_title(video_id: str) -> str:
-    """Fetch video title from YouTube (no API key needed)."""
+    """Fetch video title from YouTube."""
     try:
         url = f"https://www.youtube.com/watch?v={video_id}"
         req = urllib.request.Request(url, headers={
@@ -51,30 +68,32 @@ def get_video_title(video_id: str) -> str:
 
 
 def fetch_transcript(video_id: str) -> dict:
-    """Fetch transcript for a single video. Supports v0.x and v1.x API."""
+    """Fetch transcript for a single video."""
     try:
         title = get_video_title(video_id)
         entries = []
         lang = "en"
         is_auto = False
 
-        # Try v1.x API first (YouTubeTranscriptApi instance methods)
+        # Try listing available transcripts
         try:
             transcript_list = yt_api.list(video_id)
-            # Find best transcript
             transcript = None
 
+            # Prefer manual English
             for t in transcript_list:
                 if t.language_code == "en" and not t.is_generated:
                     transcript = t
                     break
 
+            # Then auto English
             if transcript is None:
                 for t in transcript_list:
                     if t.language_code == "en":
                         transcript = t
                         break
 
+            # Then any language
             if transcript is None:
                 for t in transcript_list:
                     transcript = t
@@ -84,17 +103,18 @@ def fetch_transcript(video_id: str) -> dict:
                 lang = transcript.language_code
                 is_auto = transcript.is_generated
                 fetched = transcript.fetch()
-                # Handle different entry formats
                 for entry in fetched:
                     if hasattr(entry, 'text'):
-                        entries.append({"text": entry.text, "start": entry.start, "duration": getattr(entry, 'duration', 0)})
+                        entries.append({
+                            "text": entry.text,
+                            "start": entry.start,
+                            "duration": getattr(entry, 'duration', 0),
+                        })
                     elif isinstance(entry, dict):
                         entries.append(entry)
-                    else:
-                        entries.append({"text": str(entry), "start": 0, "duration": 0})
 
         except AttributeError:
-            # Fall back to v0.x API (class methods)
+            # Fallback for older API versions
             try:
                 raw = YouTubeTranscriptApi.get_transcript(video_id, languages=["en"])
                 entries = raw
@@ -107,27 +127,26 @@ def fetch_transcript(video_id: str) -> dict:
 
         # Build full text
         full_text = " ".join([
-            e.get("text", e.text if hasattr(e, 'text') else str(e))
+            e.get("text", "") if isinstance(e, dict) else getattr(e, "text", str(e))
             for e in entries
         ])
 
         # Build timestamped version
         timestamped = []
         for entry in entries:
-            start = entry.get("start", 0) if isinstance(entry, dict) else getattr(entry, 'start', 0)
-            text = entry.get("text", "") if isinstance(entry, dict) else getattr(entry, 'text', str(entry))
+            start = entry.get("start", 0) if isinstance(entry, dict) else getattr(entry, "start", 0)
+            text = entry.get("text", "") if isinstance(entry, dict) else getattr(entry, "text", str(entry))
             minutes = int(float(start) // 60)
             seconds = int(float(start) % 60)
-            timestamp = f"{minutes:02d}:{seconds:02d}"
             timestamped.append({
-                "time": timestamp,
+                "time": f"{minutes:02d}:{seconds:02d}",
                 "start": float(start),
                 "text": text,
             })
 
-        last_entry = entries[-1] if entries else {}
-        last_start = last_entry.get("start", 0) if isinstance(last_entry, dict) else getattr(last_entry, 'start', 0)
-        last_dur = last_entry.get("duration", 0) if isinstance(last_entry, dict) else getattr(last_entry, 'duration', 0)
+        last = entries[-1] if entries else {}
+        last_start = last.get("start", 0) if isinstance(last, dict) else getattr(last, "start", 0)
+        last_dur = last.get("duration", 0) if isinstance(last, dict) else getattr(last, "duration", 0)
 
         return {
             "video_id": video_id,
@@ -142,8 +161,13 @@ def fetch_transcript(video_id: str) -> dict:
 
     except Exception as e:
         error_msg = str(e)
-        if "IP" in error_msg or "blocked" in error_msg:
-            return {"error": "YouTube is temporarily blocking requests. Try again in a minute.", "video_id": video_id}
+        if "IP" in error_msg or "blocked" in error_msg or "RequestBlocked" in error_msg:
+            return {
+                "error": "YouTube is blocking requests. Add cookies.txt to fix this (see README).",
+                "video_id": video_id,
+            }
+        if "Transcript" in error_msg and "disabled" in error_msg:
+            return {"error": "Transcripts are disabled for this video", "video_id": video_id}
         return {"error": error_msg, "video_id": video_id}
 
 
@@ -171,9 +195,7 @@ HTML = """
             --font-display: 'Outfit', sans-serif;
             --font-mono: 'JetBrains Mono', monospace;
         }
-
         * { margin: 0; padding: 0; box-sizing: border-box; }
-
         body {
             font-family: var(--font-display);
             background: var(--bg);
@@ -181,246 +203,56 @@ HTML = """
             min-height: 100vh;
             -webkit-font-smoothing: antialiased;
         }
-
-        .app {
-            max-width: 900px;
-            margin: 0 auto;
-            padding: 40px 24px 80px;
-        }
-
-        /* Header */
-        .logo {
-            font-size: 32px;
-            font-weight: 700;
-            letter-spacing: -1px;
-            margin-bottom: 6px;
-        }
+        .app { max-width: 900px; margin: 0 auto; padding: 40px 24px 80px; }
+        .logo { font-size: 32px; font-weight: 700; letter-spacing: -1px; margin-bottom: 6px; }
         .logo span { color: var(--accent); }
-        .subtitle {
-            font-size: 14px;
-            color: var(--text-dim);
-            font-weight: 300;
-        }
-
-        /* Input Area */
-        .input-section {
-            margin-top: 40px;
-            background: var(--surface);
-            border: 1px solid var(--border);
-            border-radius: 16px;
-            padding: 24px;
-        }
-
-        .input-label {
-            font-size: 11px;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-            color: var(--text-dim);
-            margin-bottom: 12px;
-            font-weight: 500;
-        }
-
+        .subtitle { font-size: 14px; color: var(--text-dim); font-weight: 300; }
+        .input-section { margin-top: 40px; background: var(--surface); border: 1px solid var(--border); border-radius: 16px; padding: 24px; }
+        .input-label { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 12px; font-weight: 500; }
         textarea {
-            width: 100%;
-            min-height: 120px;
-            background: var(--surface2);
-            border: 1px solid var(--border);
-            border-radius: 10px;
-            color: var(--text);
-            font-family: var(--font-mono);
-            font-size: 14px;
-            padding: 16px;
-            resize: vertical;
-            outline: none;
-            transition: border-color 0.2s;
+            width: 100%; min-height: 120px; background: var(--surface2); border: 1px solid var(--border);
+            border-radius: 10px; color: var(--text); font-family: var(--font-mono); font-size: 14px;
+            padding: 16px; resize: vertical; outline: none; transition: border-color 0.2s;
         }
         textarea:focus { border-color: var(--accent); }
         textarea::placeholder { color: var(--text-dim); opacity: 0.5; }
-
-        .btn-row {
-            display: flex;
-            gap: 12px;
-            margin-top: 16px;
-        }
-
-        .btn {
-            padding: 12px 28px;
-            border-radius: 10px;
-            font-family: var(--font-display);
-            font-size: 14px;
-            font-weight: 600;
-            cursor: pointer;
-            border: none;
-            transition: all 0.2s;
-        }
-
-        .btn-primary {
-            background: var(--accent);
-            color: #fff;
-            box-shadow: 0 0 20px var(--accent-glow);
-        }
+        .btn-row { display: flex; gap: 12px; margin-top: 16px; }
+        .btn { padding: 12px 28px; border-radius: 10px; font-family: var(--font-display); font-size: 14px; font-weight: 600; cursor: pointer; border: none; transition: all 0.2s; }
+        .btn-primary { background: var(--accent); color: #fff; box-shadow: 0 0 20px var(--accent-glow); }
         .btn-primary:hover { filter: brightness(1.1); transform: translateY(-1px); }
         .btn-primary:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
-
-        .btn-ghost {
-            background: transparent;
-            color: var(--text-dim);
-            border: 1px solid var(--border);
-        }
+        .btn-ghost { background: transparent; color: var(--text-dim); border: 1px solid var(--border); }
         .btn-ghost:hover { border-color: var(--text-dim); color: var(--text); }
-
-        /* Status */
-        .status {
-            margin-top: 16px;
-            font-size: 13px;
-            color: var(--text-dim);
-            min-height: 20px;
-        }
+        .status { margin-top: 16px; font-size: 13px; color: var(--text-dim); min-height: 20px; }
         .status.loading { color: var(--accent); }
         .status.error { color: #f87171; }
         .status.success { color: var(--success); }
-
-        /* Results */
         .results { margin-top: 32px; }
-
-        .result-card {
-            background: var(--surface);
-            border: 1px solid var(--border);
-            border-radius: 16px;
-            margin-bottom: 20px;
-            overflow: hidden;
-            animation: fadeIn 0.3s ease;
-        }
-
-        @keyframes fadeIn {
-            from { opacity: 0; transform: translateY(10px); }
-            to { opacity: 1; transform: translateY(0); }
-        }
-
-        .result-header {
-            padding: 20px 24px;
-            display: flex;
-            justify-content: space-between;
-            align-items: flex-start;
-            border-bottom: 1px solid var(--border);
-            gap: 16px;
-        }
-
-        .result-title {
-            font-size: 16px;
-            font-weight: 600;
-            line-height: 1.4;
-            flex: 1;
-        }
-
-        .result-meta {
-            display: flex;
-            gap: 16px;
-            font-size: 12px;
-            color: var(--text-dim);
-            margin-top: 6px;
-            flex-wrap: wrap;
-        }
-
-        .result-actions {
-            display: flex;
-            gap: 8px;
-            flex-shrink: 0;
-        }
-
-        .btn-sm {
-            padding: 6px 14px;
-            border-radius: 6px;
-            font-size: 12px;
-            font-weight: 500;
-            cursor: pointer;
-            border: 1px solid var(--border);
-            background: var(--surface2);
-            color: var(--text-dim);
-            font-family: var(--font-display);
-            transition: all 0.15s;
-        }
+        .result-card { background: var(--surface); border: 1px solid var(--border); border-radius: 16px; margin-bottom: 20px; overflow: hidden; animation: fadeIn 0.3s ease; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+        .result-header { padding: 20px 24px; display: flex; justify-content: space-between; align-items: flex-start; border-bottom: 1px solid var(--border); gap: 16px; }
+        .result-title { font-size: 16px; font-weight: 600; line-height: 1.4; flex: 1; }
+        .result-meta { display: flex; gap: 16px; font-size: 12px; color: var(--text-dim); margin-top: 6px; flex-wrap: wrap; }
+        .result-actions { display: flex; gap: 8px; flex-shrink: 0; }
+        .btn-sm { padding: 6px 14px; border-radius: 6px; font-size: 12px; font-weight: 500; cursor: pointer; border: 1px solid var(--border); background: var(--surface2); color: var(--text-dim); font-family: var(--font-display); transition: all 0.15s; }
         .btn-sm:hover { border-color: var(--accent); color: var(--text); }
         .btn-sm.copied { border-color: var(--success); color: var(--success); }
-
-        /* Tabs */
-        .tabs {
-            display: flex;
-            border-bottom: 1px solid var(--border);
-        }
-
-        .tab {
-            padding: 12px 20px;
-            font-size: 13px;
-            font-weight: 500;
-            color: var(--text-dim);
-            cursor: pointer;
-            border-bottom: 2px solid transparent;
-            transition: all 0.15s;
-            background: none;
-            border-top: none;
-            border-left: none;
-            border-right: none;
-            font-family: var(--font-display);
-        }
+        .tabs { display: flex; border-bottom: 1px solid var(--border); }
+        .tab { padding: 12px 20px; font-size: 13px; font-weight: 500; color: var(--text-dim); cursor: pointer; border-bottom: 2px solid transparent; transition: all 0.15s; background: none; border-top: none; border-left: none; border-right: none; font-family: var(--font-display); }
         .tab:hover { color: var(--text); }
         .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
-
-        /* Transcript Body */
-        .transcript-body {
-            padding: 20px 24px;
-            max-height: 500px;
-            overflow-y: auto;
-            font-size: 14px;
-            line-height: 1.8;
-        }
-
+        .transcript-body { padding: 20px 24px; max-height: 500px; overflow-y: auto; font-size: 14px; line-height: 1.8; }
         .transcript-body::-webkit-scrollbar { width: 6px; }
         .transcript-body::-webkit-scrollbar-track { background: transparent; }
         .transcript-body::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
-
-        .transcript-text {
-            color: var(--text);
-            white-space: pre-wrap;
-            font-family: var(--font-display);
-        }
-
-        .ts-line {
-            display: flex;
-            gap: 16px;
-            padding: 4px 0;
-            border-bottom: 1px solid var(--border);
-        }
+        .transcript-text { color: var(--text); white-space: pre-wrap; font-family: var(--font-display); }
+        .ts-line { display: flex; gap: 16px; padding: 4px 0; border-bottom: 1px solid var(--border); }
         .ts-line:last-child { border-bottom: none; }
-
-        .ts-time {
-            font-family: var(--font-mono);
-            font-size: 12px;
-            color: var(--accent);
-            flex-shrink: 0;
-            padding-top: 2px;
-            cursor: pointer;
-            min-width: 48px;
-        }
+        .ts-time { font-family: var(--font-mono); font-size: 12px; color: var(--accent); flex-shrink: 0; padding-top: 2px; cursor: pointer; min-width: 48px; }
         .ts-time:hover { text-decoration: underline; }
-
-        .ts-text {
-            color: var(--text);
-            font-size: 14px;
-        }
-
-        .error-card {
-            background: var(--surface);
-            border: 1px solid #7f1d1d;
-            border-radius: 16px;
-            padding: 20px 24px;
-            margin-bottom: 20px;
-            color: #fca5a5;
-            font-size: 14px;
-        }
+        .ts-text { color: var(--text); font-size: 14px; }
+        .error-card { background: var(--surface); border: 1px solid #7f1d1d; border-radius: 16px; padding: 20px 24px; margin-bottom: 20px; color: #fca5a5; font-size: 14px; }
         .error-card strong { color: #f87171; }
-
-        /* Responsive */
         @media (max-width: 600px) {
             .app { padding: 24px 16px 60px; }
             .logo { font-size: 26px; }
@@ -436,131 +268,96 @@ HTML = """
     <div class="app">
         <div class="logo"><span>YT</span> Transcriber</div>
         <div class="subtitle">Pull transcripts from YouTube videos. Copy, download, or read with timestamps.</div>
-
         <div class="input-section">
             <div class="input-label">YouTube URLs (one per line)</div>
-            <textarea id="urlInput" placeholder="https://www.youtube.com/watch?v=dQw4w9WgXcQ&#10;https://youtu.be/another-video&#10;https://youtube.com/shorts/short-id"></textarea>
+            <textarea id="urlInput" placeholder="https://www.youtube.com/watch?v=dQw4w9WgXcQ&#10;https://youtu.be/another-video"></textarea>
             <div class="btn-row">
                 <button class="btn btn-primary" id="fetchBtn" onclick="fetchTranscripts()">Fetch Transcripts</button>
                 <button class="btn btn-ghost" onclick="clearAll()">Clear</button>
             </div>
             <div class="status" id="status"></div>
         </div>
-
         <div class="results" id="results"></div>
     </div>
-
     <script>
         async function fetchTranscripts() {
             const urls = document.getElementById('urlInput').value.trim().split('\\n').filter(u => u.trim());
             if (!urls.length) return;
-
             const btn = document.getElementById('fetchBtn');
             const status = document.getElementById('status');
             const results = document.getElementById('results');
-
-            btn.disabled = true;
-            btn.textContent = 'Fetching...';
+            btn.disabled = true; btn.textContent = 'Fetching...';
             status.className = 'status loading';
-            status.textContent = `Fetching ${urls.length} transcript(s)...`;
             results.innerHTML = '';
-
             for (let i = 0; i < urls.length; i++) {
-                status.textContent = `Fetching ${i + 1} of ${urls.length}...`;
-
+                status.textContent = 'Fetching ' + (i+1) + ' of ' + urls.length + '...';
                 try {
                     const resp = await fetch('/api/transcript', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ url: urls[i].trim() })
+                        method: 'POST', headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({url: urls[i].trim()})
                     });
                     const data = await resp.json();
-
-                    if (data.error) {
-                        results.innerHTML += renderError(data);
-                    } else {
-                        results.innerHTML += renderResult(data, i);
-                    }
-                } catch (e) {
-                    results.innerHTML += renderError({ error: e.message, video_id: urls[i] });
+                    results.innerHTML += data.error ? renderError(data) : renderResult(data, i);
+                } catch(e) {
+                    results.innerHTML += renderError({error: e.message, video_id: urls[i]});
                 }
             }
-
-            btn.disabled = false;
-            btn.textContent = 'Fetch Transcripts';
+            btn.disabled = false; btn.textContent = 'Fetch Transcripts';
             status.className = 'status success';
-            status.textContent = `Done. ${urls.length} video(s) processed.`;
+            status.textContent = 'Done. ' + urls.length + ' video(s) processed.';
         }
-
         function renderError(data) {
-            return `<div class="error-card"><strong>Error:</strong> ${data.error}<br><span style="color:#7a7a88">${data.video_id || ''}</span></div>`;
+            return '<div class="error-card"><strong>Error:</strong> ' + data.error + '<br><span style="color:#7a7a88">' + (data.video_id||'') + '</span></div>';
         }
-
         function renderResult(data, idx) {
             const dur = data.duration_seconds;
-            const mins = Math.floor(dur / 60);
-            const secs = dur % 60;
-            const duration = `${mins}:${secs.toString().padStart(2, '0')}`;
-
+            const mins = Math.floor(dur/60);
+            const secs = dur%60;
+            const duration = mins + ':' + secs.toString().padStart(2,'0');
             let tsHtml = '';
             if (data.timestamped) {
                 tsHtml = data.timestamped.map(t =>
-                    `<div class="ts-line"><a class="ts-time" href="https://youtube.com/watch?v=${data.video_id}&t=${Math.floor(t.start)}" target="_blank">${t.time}</a><span class="ts-text">${t.text}</span></div>`
+                    '<div class="ts-line"><a class="ts-time" href="https://youtube.com/watch?v='+data.video_id+'&t='+Math.floor(t.start)+'" target="_blank">'+t.time+'</a><span class="ts-text">'+t.text+'</span></div>'
                 ).join('');
             }
-
-            return `
-            <div class="result-card" id="card-${idx}">
-                <div class="result-header">
-                    <div>
-                        <div class="result-title">${data.title}</div>
-                        <div class="result-meta">
-                            <span>${data.word_count.toLocaleString()} words</span>
-                            <span>${duration}</span>
-                            <span>${data.is_auto_generated ? 'Auto-generated' : 'Manual'} (${data.language})</span>
-                        </div>
-                    </div>
-                    <div class="result-actions">
-                        <button class="btn-sm" onclick="copyText('${idx}', this)">Copy</button>
-                        <button class="btn-sm" onclick="downloadText('${idx}', '${data.title}')">Download</button>
-                    </div>
-                </div>
-                <div class="tabs">
-                    <button class="tab active" onclick="showTab(${idx}, 'plain', this)">Plain Text</button>
-                    <button class="tab" onclick="showTab(${idx}, 'timestamps', this)">Timestamps</button>
-                </div>
-                <div class="transcript-body">
-                    <div id="tab-${idx}-plain" class="transcript-text">${data.full_text}</div>
-                    <div id="tab-${idx}-timestamps" style="display:none">${tsHtml}</div>
-                </div>
-            </div>`;
+            return '<div class="result-card" id="card-'+idx+'">' +
+                '<div class="result-header"><div>' +
+                '<div class="result-title">'+data.title+'</div>' +
+                '<div class="result-meta"><span>'+data.word_count.toLocaleString()+' words</span><span>'+duration+'</span><span>'+(data.is_auto_generated?'Auto':'Manual')+' ('+data.language+')</span></div>' +
+                '</div><div class="result-actions">' +
+                '<button class="btn-sm" onclick="copyText(\''+idx+'\',this)">Copy</button>' +
+                '<button class="btn-sm" onclick="downloadText(\''+idx+'\',\''+data.title.replace(/'/g,"\\'")+'\')">Download</button>' +
+                '</div></div>' +
+                '<div class="tabs">' +
+                '<button class="tab active" onclick="showTab('+idx+',\'plain\',this)">Plain Text</button>' +
+                '<button class="tab" onclick="showTab('+idx+',\'timestamps\',this)">Timestamps</button>' +
+                '</div>' +
+                '<div class="transcript-body">' +
+                '<div id="tab-'+idx+'-plain" class="transcript-text">'+data.full_text+'</div>' +
+                '<div id="tab-'+idx+'-timestamps" style="display:none">'+tsHtml+'</div>' +
+                '</div></div>';
         }
-
         function showTab(idx, tab, el) {
-            document.getElementById(`tab-${idx}-plain`).style.display = tab === 'plain' ? '' : 'none';
-            document.getElementById(`tab-${idx}-timestamps`).style.display = tab === 'timestamps' ? '' : 'none';
+            document.getElementById('tab-'+idx+'-plain').style.display = tab==='plain'?'':'none';
+            document.getElementById('tab-'+idx+'-timestamps').style.display = tab==='timestamps'?'':'none';
             el.parentElement.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
             el.classList.add('active');
         }
-
         function copyText(idx, btn) {
-            const el = document.getElementById(`tab-${idx}-plain`);
+            const el = document.getElementById('tab-'+idx+'-plain');
             navigator.clipboard.writeText(el.textContent).then(() => {
-                btn.textContent = 'Copied!';
-                btn.classList.add('copied');
-                setTimeout(() => { btn.textContent = 'Copy'; btn.classList.remove('copied'); }, 2000);
+                btn.textContent='Copied!'; btn.classList.add('copied');
+                setTimeout(() => { btn.textContent='Copy'; btn.classList.remove('copied'); }, 2000);
             });
         }
-
         function downloadText(idx, title) {
-            const el = document.getElementById(`tab-${idx}-plain`);
-            const blob = new Blob([el.textContent], { type: 'text/plain' });
+            const el = document.getElementById('tab-'+idx+'-plain');
+            const blob = new Blob([el.textContent], {type:'text/plain'});
             const a = document.createElement('a');
             a.href = URL.createObjectURL(blob);
-            a.download = (title || 'transcript').replace(/[^a-zA-Z0-9 ]/g, '') + '.txt';
+            a.download = (title||'transcript').replace(/[^a-zA-Z0-9 ]/g,'') + '.txt';
             a.click();
         }
-
         function clearAll() {
             document.getElementById('urlInput').value = '';
             document.getElementById('results').innerHTML = '';
@@ -581,16 +378,22 @@ def index():
 def api_transcript():
     data = request.get_json()
     url = data.get("url", "")
-
     video_id = extract_video_id(url)
     if not video_id:
         return jsonify({"error": "Invalid YouTube URL", "video_id": url})
-
     result = fetch_transcript(video_id)
     return jsonify(result)
 
 
+@app.route("/health")
+def health():
+    """Health check endpoint."""
+    has_cookies = os.path.exists(COOKIE_PATH)
+    return jsonify({"status": "ok", "cookies": has_cookies})
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    print(f"\n  YT Transcriber running at http://localhost:{port}\n")
+    print(f"\n  YT Transcriber running at http://localhost:{port}")
+    print(f"  Cookies: {'loaded' if os.path.exists(COOKIE_PATH) else 'NOT FOUND'}\n")
     app.run(host="0.0.0.0", port=port, debug=False)
